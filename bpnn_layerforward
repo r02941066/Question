@@ -1,0 +1,152 @@
+__global__ void reduction(float *out, float *in, float *in2, int size)
+{
+  __shared__ float partialSum[BLOCK_SIZE * 2];
+
+	unsigned int t = threadIdx.x;
+	unsigned int start = blockIdx.x * 2 * BLOCK_SIZE;
+
+	if (start + t < size) {
+		partialSum[t] = in[start + t] * in2[start + t];
+	}
+	else {
+		partialSum[t] = 0;
+	}
+
+	if (start + BLOCK_SIZE + t < size) {
+		partialSum[BLOCK_SIZE + t] = in[start + BLOCK_SIZE + t] * in2[start + BLOCK_SIZE + t];
+	}
+	else {
+		partialSum[BLOCK_SIZE + t] = 0;
+	}
+	__syncthreads();
+
+	for (unsigned int stride = BLOCK_SIZE; stride > 0; stride /= 2) {
+		__syncthreads();
+		if (t < stride) {
+			partialSum[t] += partialSum[t + stride];
+		}
+	}
+
+	if (t == 0) {
+		out[blockIdx.x] = partialSum[0];
+	}
+}
+
+void bpnn_layerforward(float* l1, float* l2, float* conn, int n1, int n2)
+{
+#ifdef USE_GPU
+  int j;
+  float **in_d, *in_d2, **in_temp;
+  float **out_d, **out_h;
+  float *sum;
+  cudaError_t cuda_ret;
+  dim3 dim_grid, dim_block;
+  cudaStream_t *stream;
+  
+  // Create multiple dynamic streams
+  stream = (cudaStream_t*)malloc(sizeof(cudaStream_t) * n2);
+  for (int i2 = 0; i2 < n2; i2++) {
+  	cudaStreamCreate(&stream[i2]);
+  }
+
+  /*** Set up thresholding unit ***/
+  l1[0] = 1.0;
+
+  // Use temporary 2D array to store elements for each streams separately
+  in_temp = (float**)malloc(n2 * sizeof(float*));
+  for (int i3 = 0; i3 < n2; i3++) {
+  	in_temp[i3] = (float*)malloc((n1 + 1) * sizeof(float));
+  }
+
+  out_h = (float**)malloc(n2 * sizeof(float*));
+  for (int i3 = 0; i3 < n2; i3++) {
+  	out_h[i3] = (float*)malloc((n1 / BLOCK_SIZE + 1) * sizeof(float));
+  }
+  
+  sum = (float*)malloc((n2) * sizeof(float));
+
+  // Dynamic allocate 2D dynamic cuda memory for each streams
+  cuda_ret = cudaHostAlloc((void**)&in_d, n2 * sizeof(float*), cudaHostAllocDefault);
+  if(cuda_ret != cudaSuccess) FATAL("Unable to allocate device memory");
+  for (int i3 = 0; i3 < n2; i3++) {
+  	cuda_ret = cudaHostAlloc((void**)&in_d[i3], (n1 + 1) * sizeof(float), cudaHostAllocDefault);
+	if(cuda_ret != cudaSuccess) FATAL("Unable to allocate device memory");
+  }
+  cuda_ret = cudaHostAlloc((void**)&in_d2, (n1 + 1) * sizeof(float), cudaHostAllocDefault);
+  if(cuda_ret != cudaSuccess) FATAL("Unable to allocate device memory");
+  cuda_ret = cudaHostAlloc((void**)&out_d, n2 * sizeof(float*), cudaHostAllocDefault);
+  if(cuda_ret != cudaSuccess) FATAL("Unable to allocate device memory");
+  for (int i3 = 0; i3 < n2; i3++) {
+    cuda_ret = cudaHostAlloc((void**)&out_d[i3], (n1 / BLOCK_SIZE + 1) * sizeof(float), cudaHostAllocDefault);
+	if(cuda_ret != cudaSuccess) FATAL("Unable to allocate device memory");
+  }
+
+  cudaDeviceSynchronize();
+
+  cuda_ret = cudaMemcpy(in_d2, l1, (n1 + 1) * sizeof(float),cudaMemcpyHostToDevice);
+  if(cuda_ret != cudaSuccess) FATAL("Unable to copy memory to the device");
+  for (int i3 = 0; i3 < n2; i3++) {
+  	cuda_ret = cudaMemset(out_d[i3], 0, (n1 / BLOCK_SIZE + 1) * sizeof(float));
+	if(cuda_ret != cudaSuccess) FATAL("Unable to set device memory");
+  }
+  cudaDeviceSynchronize();
+
+  dim_block.x = BLOCK_SIZE; dim_block.y = dim_block.z = 1;
+  dim_grid.x = n1 / BLOCK_SIZE + 1; dim_grid.y = dim_grid.z = 1;
+  printf("\nIt is GPU.\n");
+
+  /*** For each unit in second layer ***/
+  for (j = 1; j <= n2; j++) {
+
+  	for (int i1 = 0; i1 <= n1; i1++) { 
+		in_temp[j-1][i1] = conn[(n2 + 1) * i1 + j];
+	}
+
+	cuda_ret = cudaMemcpyAsync(in_d[j-1], in_temp[j-1], (n1 + 1) * sizeof(float),cudaMemcpyHostToDevice, stream[j-1]);
+	if(cuda_ret != cudaSuccess) FATAL("Unable to copy memory to the device");
+  }
+	
+    /*** Compute weighted sum of its inputs ***/
+  for (j = 1; j <= n2; j++) {
+    sum[j-1] = 0.0;
+    reduction<<<dim_grid, dim_block, 0, stream[j-1]>>>(out_d[j-1], in_d[j-1], in_d2, (n1+1));
+  }
+
+  for(j = 1; j <= n2; j++) {
+    cuda_ret = cudaMemcpyAsync(out_h[j-1], out_d[j-1], (n1 / BLOCK_SIZE + 1) * sizeof(float),cudaMemcpyDeviceToHost, stream[j-1]);
+    if(cuda_ret != cudaSuccess) FATAL("Unable to copy memory to host");
+    //cudaDeviceSynchronize();
+
+    for (int i = 0; i < n1 / BLOCK_SIZE + 1; i++) {
+      sum[j-1] += out_h[j-1][i];
+    }
+    l2[j] = squash(sum[j-1]);
+  }
+
+  free(sum);    cudaFreeHost(in_d2);
+  for (int i3 = 0; i3 < n2; i3++) {
+  	free(in_temp[i3]);
+	free(out_h[i3]);
+	cudaFree(in_d[i3]);
+	cudaFree(out_d[i3]);
+  }
+  cudaFree(in_d);   
+  free(in_temp);      free(out_h);
+  cudaFree(out_d);
+#else
+  float sum;
+  int j, k;
+
+  /*** Set up thresholding unit ***/
+  l1[0] = 1.0;
+  /*** For each unit in second layer ***/
+  for (j = 1; j <= n2; j++) {
+    /*** Compute weighted sum of its inputs ***/
+    sum = 0.0;
+    for (k = 0; k <= n1; k++) {
+      sum += conn[k*(n2+1) + j] * l1[k];
+    }
+    l2[j] = squash(sum);
+  }
+#endif
+}
